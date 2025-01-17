@@ -61,25 +61,31 @@ extension DiskStorage: StorageAware {
     
     public func entry(forKey key: Key) throws -> Entry<Value> {
         let filePath = makeFilePath(for: key)
-        let data = try Data(contentsOf: URL(fileURLWithPath: filePath, isDirectory: false))
-        let attributes = try fileManager.attributesOfItem(atPath: filePath)
-        let object = try transformer.fromData(data)
+        let fileURL = URL(fileURLWithPath: filePath, isDirectory: false)
         
+        let object: Value
+        if let fromFile = transformer.fromFile {
+            // Let the Transformer do direct on-disk MD5, memory-mapping, etc.
+            object = try fromFile(fileURL)
+        } else {
+            // Fallback to reading all data into memory
+            let data = try Data(contentsOf: fileURL)
+            object = try transformer.fromData(data)
+        }
+        
+        let attributes = try fileManager.attributesOfItem(atPath: filePath)
         guard let date = attributes[.modificationDate] as? Date else {
             throw StorageError.malformedFileAttributes
         }
         
-        return Entry(
-            object: object,
-            expiry: Expiry.date(date),
-            filePath: filePath
-        )
+        return Entry(object: object, expiry: Expiry.date(date), filePath: filePath)
     }
     
     public func setObject(_ object: Value, forKey key: Key, expiry: Expiry? = nil) throws {
         let expiry = expiry ?? config.expiry
         let data = try transformer.toData(object)
         let filePath = makeFilePath(for: key)
+        try createDirectory()
         _ = fileManager.createFile(atPath: filePath, contents: data, attributes: nil)
         try fileManager.setAttributes([.modificationDate: expiry.date], ofItemAtPath: filePath)
     }
