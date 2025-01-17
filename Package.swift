@@ -4,7 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "Cache",
-    platforms: [.macOS(.v11), .iOS(.v14), .watchOS(.v3)],
+    platforms: [.macOS(.v11), .iOS(.v14), .watchOS(.v4)],
     products: [
         .library(
             name: "Cache",
