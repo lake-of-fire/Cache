@@ -1,9 +1,10 @@
-// swift-tools-version:5.5
+// swift-tools-version:5.7
 
 import PackageDescription
 
 let package = Package(
     name: "Cache",
+    platforms: [.macOS(.v11), .iOS(.v14), .watchOS(.v3)],
     products: [
         .library(
             name: "Cache",
