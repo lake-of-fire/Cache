@@ -3,7 +3,7 @@ import UIKit
 #endif
 
 import Foundation
-import CryptoKit
+import CommonCrypto // Faster for SHA-1 hashing than CryptoKit (maybe)
 
 public class TransformerFactory {
     public static func forData() -> Transformer<Data> {
@@ -41,8 +41,8 @@ public class TransformerFactory {
         return Transformer<U>(toData: toData, fromData: fromData)
     }
     
-    /// Single-pass memory-mapped MD5 check, then decode.
-    /// - `expectedChecksum`: MD5 hash of file
+    /// Single-pass memory-mapped SHA-1 check, then decode.
+    /// - `expectedChecksum`: SHA-1 hash of file
     /// - `toData`: custom serializer to Data (e.g. `cache.toCustomBinaryData()`)
     /// - `fromData`: fallback if `fromFile` not used
     public static func forMemoryMappedFileWithChecksum<T>(
@@ -50,72 +50,64 @@ public class TransformerFactory {
         toData: @escaping (T) throws -> Data,
         fromData: @escaping (Data) throws -> T
     ) -> Transformer<T> {
-        Transformer<T>(
+        let expectedChecksum = expectedChecksum.lowercased()
+        return Transformer<T>(
             toData: { object in
                 try toData(object)
             },
             fromData: { data in
-                // Fallback MD5 check on in-memory data (hex match with `md5 -q`)
-                let md5 = data.withUnsafeBytes { buf -> Insecure.MD5.Digest in
-                    var ctx = Insecure.MD5()
-                    ctx.update(bufferPointer: buf)
-                    return ctx.finalize()
-                }
-                let actual = md5.map { String(format: "%02x", $0) }.joined()
-                guard actual.lowercased() == expectedChecksum.lowercased() else {
-                    throw NSError(domain: "TransformerFactory", code: 1, userInfo: [
-                        NSLocalizedDescriptionKey: "MD5 mismatch. Expected \(expectedChecksum), got \(actual)"
-                    ])
-                }
-                return try fromData(data)
+                fatalError("TransformFactory.forMemoryMappedFileWithChecksum requires fromFile")
             },
             fromFile: { fileURL in
-                // 1) Open + mmap
-                let fd = open(fileURL.path, O_RDONLY)
-                guard fd >= 0 else {
-                    throw NSError(domain: "TransformerFactory", code: 2, userInfo: nil)
-                }
-                defer { close(fd) }
+                // Calculate the SHA-1 checksum directly from the file
+                let actualHex = try sha1Checksum(for: fileURL)
                 
-                let fileLen = lseek(fd, 0, SEEK_END)
-                guard fileLen > 0 else {
-                    throw NSError(domain: "TransformerFactory", code: 3, userInfo: nil)
-                }
-                _ = lseek(fd, 0, SEEK_SET)
-                
-                let ptr = mmap(nil, Int(fileLen), PROT_READ, MAP_PRIVATE, fd, 0)
-                guard ptr != MAP_FAILED else {
-                    throw NSError(domain: "TransformerFactory", code: 4, userInfo: nil)
-                }
-                defer { munmap(ptr, Int(fileLen)) }
-                
-                // 2) MD5 on mapped bytes
-                let buf = UnsafeRawBufferPointer(start: ptr, count: Int(fileLen))
-                var md5 = Insecure.MD5()
-                md5.update(bufferPointer: buf)
-                let digest = md5.finalize()
-                let actualHex = digest.map { String(format: "%02x", $0) }.joined()
-                guard actualHex.lowercased() == expectedChecksum.lowercased() else {
+                guard actualHex == expectedChecksum else {
+                    print("TransformerFactory.forMemoryMappedFileWithChecksum: SHA-1 mismatch. Expected \(expectedChecksum), got \(actualHex)")
                     throw NSError(domain: "TransformerFactory", code: 5, userInfo: [
-                        NSLocalizedDescriptionKey: "MD5 mismatch. Expected \(expectedChecksum), got \(actualHex)"
+                        NSLocalizedDescriptionKey: "SHA-1 mismatch. Expected \(expectedChecksum), got \(actualHex)"
                     ])
                 }
                 
-                // 3) Decode from same bytes (no extra copy)
-                // Ensure the pointer is non-nil before creating Data
-                guard let baseAddress = ptr else {
-                    throw NSError(domain: "TransformerFactory", code: 6, userInfo: [
-                        NSLocalizedDescriptionKey: "Failed to memory-map the file: null pointer"
-                    ])
-                }
-                let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: baseAddress),
-                                count: Int(fileLen),
-                                deallocator: .none)
-                
-                // Decode the data
-                
+                // Read the file content into memory-mapped data
+                let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
                 return try fromData(data)
             }
         )
     }
+}
+
+/// Computes the SHA-1 checksum for a file, mimicking the behavior of the `sha1` CLI tool.
+///
+/// - Parameter fileURL: The URL of the file to hash.
+/// - Returns: The hexadecimal SHA-1 checksum string.
+/// - Throws: An error if the file cannot be read.
+fileprivate func sha1Checksum(for fileURL: URL) throws -> String {
+    let bufferSize = 64 * 1024 // 64 KB buffer size
+    
+    // Open the file
+    let fileHandle = try FileHandle(forReadingFrom: fileURL)
+    defer { fileHandle.closeFile() }
+    
+    // Initialize the SHA-1 context
+    var context = CC_SHA1_CTX()
+    CC_SHA1_Init(&context)
+    
+    // Read the file in chunks and update the hash
+    while autoreleasepool(invoking: {
+        let data = fileHandle.readData(ofLength: bufferSize)
+        guard !data.isEmpty else { return false }
+        
+        data.withUnsafeBytes { buffer in
+            _ = CC_SHA1_Update(&context, buffer.baseAddress, CC_LONG(buffer.count))
+        }
+        return true
+    }) {}
+    
+    // Finalize the hash
+    var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+    CC_SHA1_Final(&digest, &context)
+    
+    // Convert the digest to a hexadecimal string
+    return digest.map { String(format: "%02x", $0) }.joined()
 }
