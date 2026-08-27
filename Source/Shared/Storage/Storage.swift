@@ -14,8 +14,15 @@ public final class Storage<Key: Hashable, Value> {
   /// - Parameters:
   ///   - diskConfig: Configuration for disk storage
   ///   - memoryConfig: Optional. Pass config if you want memory cache
+  ///   - fileManager: File manager used by disk storage
+  ///   - transformer: Converts values to and from disk data
   /// - Throws: Throw StorageError if any.
-    public convenience init(diskConfig: DiskConfig, memoryConfig: MemoryConfig, fileManager: FileManager, transformer: Transformer<Value>) throws {
+  public convenience init(
+    diskConfig: DiskConfig,
+    memoryConfig: MemoryConfig,
+    fileManager: FileManager = .default,
+    transformer: Transformer<Value>
+  ) throws {
     let disk = try DiskStorage<Key, Value>(config: diskConfig, fileManager: fileManager, transformer: transformer)
     let memory = MemoryStorage<Key, Value>(config: memoryConfig)
     let hybridStorage = HybridStorage(memoryStorage: memory, diskStorage: disk)
