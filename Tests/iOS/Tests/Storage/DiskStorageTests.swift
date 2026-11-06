@@ -253,5 +253,48 @@ final class DiskStorageTests: XCTestCase {
     let filePath = "\(storage.path)/\(storage.makeFileName(for: key))"
     XCTAssertEqual(storage.makeFilePath(for: key), filePath)
   }
+
+  func testLiteralKeyModeCannotEscapeItsCacheDirectory() throws {
+    let root = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-path-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Named", directory: root, keysAsFilenames: true),
+      transformer: TransformerFactory.forData()
+    )
+    let cacheDirectory = URL(fileURLWithPath: disk.path, isDirectory: true).standardizedFileURL
+    let outside = root.appendingPathComponent("outside.bin")
+    let sentinel = Data("not a cache entry".utf8)
+    try sentinel.write(to: outside)
+
+    for key in ["../outside.bin", "../../other.bin", "a/b", "a\\b", "..", ".", ""] {
+      let filePath = URL(fileURLWithPath: disk.makeFilePath(for: key))
+      XCTAssertEqual(filePath.deletingLastPathComponent().standardizedFileURL,
+                     cacheDirectory, key)
+      let payload = Data(("value for " + key).utf8)
+      try disk.setObject(payload, forKey: key)
+      XCTAssertEqual(try disk.object(forKey: key), payload, key)
+      XCTAssertEqual(try Data(contentsOf: outside), sentinel, key)
+      try disk.removeObject(forKey: key)
+      XCTAssertEqual(try Data(contentsOf: outside), sentinel, key)
+    }
+  }
+
+  func testLiteralKeyModePreservesOrdinaryFilenameCompatibility() throws {
+    let root = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-safe-names-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Named", directory: root, keysAsFilenames: true),
+      transformer: TransformerFactory.forData()
+    )
+
+    for key in ["plain", "chapter.html", "日本語.txt", ".hidden"] {
+      XCTAssertEqual(disk.makeFilePath(for: key), disk.path + "/" + key)
+      try disk.setObject(Data(key.utf8), forKey: key)
+      XCTAssertEqual(try disk.object(forKey: key), Data(key.utf8))
+    }
+  }
+
 }
 

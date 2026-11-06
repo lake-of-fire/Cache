@@ -194,8 +194,13 @@ extension DiskStorage {
      - Returns: A string path based on key
      */
     func makeFilePath(for key: Key) -> String {
-        if config.keysAsFilenames, let keyStr = key as? String {
-            return "\(path)/\(key)"
+        if config.keysAsFilenames, let keyStr = key as? String,
+           !keyStr.isEmpty, keyStr != ".", keyStr != "..",
+           !keyStr.contains("/"), !keyStr.contains("\\"),
+           !keyStr.unicodeScalars.contains(where: { $0.value == 0 }) {
+            // Only a single path component may be a literal cache filename.
+            // Unsafe names take the deterministic hashed path, never a parent.
+            return "\(path)/\(keyStr)"
         }
         return "\(path)/\(makeFileName(for: key))"
     }
