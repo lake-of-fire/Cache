@@ -114,7 +114,10 @@ extension DiskStorage: StorageAware {
         let fileEnumerator = fileManager.enumerator(
             at: storageURL,
             includingPropertiesForKeys: resourceKeys,
-            options: .skipsHiddenFiles,
+            // Literal-filename caches may legitimately store dot-prefixed
+            // keys. Skipping hidden files makes their expiry and size limits
+            // unenforceable.
+            options: [],
             errorHandler: nil
         )
         
@@ -194,8 +197,13 @@ extension DiskStorage {
      - Returns: A string path based on key
      */
     func makeFilePath(for key: Key) -> String {
-        if config.keysAsFilenames, let keyStr = key as? String {
-            return "\(path)/\(key)"
+        if config.keysAsFilenames, let keyStr = key as? String,
+           !keyStr.isEmpty, keyStr != ".", keyStr != "..",
+           !keyStr.contains("/"), !keyStr.contains("\\"),
+           !keyStr.unicodeScalars.contains(where: { $0.value == 0 }) {
+            // Only a single path component may be a literal cache filename.
+            // Unsafe names take the deterministic hashed path, never a parent.
+            return "\(path)/\(keyStr)"
         }
         return "\(path)/\(makeFileName(for: key))"
     }
@@ -275,9 +283,8 @@ public extension DiskStorage {
 public extension DiskStorage {
     /// Calculates the total size of the cache directory in bytes.
     var totalSize: Int? {
-        if let directory = URL(string: self.path), let size = self.fileManager.sizeOfDirectory(at: directory) {
-            return size
-        }
-        return nil
+        // Filesystem paths are not URI strings: '#' and '%' in a directory
+        // name would otherwise become a fragment or an invalid escape.
+        fileManager.sizeOfDirectory(at: URL(fileURLWithPath: path, isDirectory: true))
     }
 }
