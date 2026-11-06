@@ -82,8 +82,10 @@ extension HybridStorage: StorageAware {
   }
 
   public func removeAll() throws {
-    memoryStorage.removeAll()
+    // If disk removal fails, preserve the still-readable memory cache.
+    // Publish the cleared state only after the disk operation succeeds.
     try diskStorage.removeAll()
+    memoryStorage.removeAll()
 
     notifyStorageObservers(about: .removeAll)
     notifyKeyObservers(about: .remove)

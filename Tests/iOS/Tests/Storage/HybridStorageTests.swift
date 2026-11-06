@@ -382,4 +382,30 @@ final class HybridStorageTests: XCTestCase {
     XCTAssertTrue(storage.keyObservations.isEmpty)
   }
 
+
+  func testFailedDiskRemoveAllKeepsInMemoryObjectsAndDoesNotNotify() throws {
+    let root = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-remove-all-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let memory = MemoryStorage<String, User>(config: MemoryConfig())
+    let disk = try DiskStorage<String, User>(
+      config: DiskConfig(name: "RemovalFailure", directory: root),
+      transformer: TransformerFactory.forCodable(ofType: User.self)
+    )
+    let cache = HybridStorage(memoryStorage: memory, diskStorage: disk)
+    try cache.setObject(testObject, forKey: "kept")
+    var notificationCount = 0
+    let token = cache.addStorageObserver(self) { _, _, _ in
+      notificationCount += 1
+    }
+    defer { token.cancel() }
+
+    // Simulate external deletion of the backing directory. The disk
+    // operation now fails, but the in-memory copy is still valid.
+    try fileManager.removeItem(atPath: disk.path)
+    XCTAssertThrowsError(try cache.removeAll())
+    XCTAssertEqual(try memory.object(forKey: "kept"), testObject)
+    XCTAssertEqual(notificationCount, 0)
+  }
+
 }
