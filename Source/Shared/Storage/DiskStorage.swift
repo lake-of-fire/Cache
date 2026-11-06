@@ -280,9 +280,8 @@ public extension DiskStorage {
 public extension DiskStorage {
     /// Calculates the total size of the cache directory in bytes.
     var totalSize: Int? {
-        if let directory = URL(string: self.path), let size = self.fileManager.sizeOfDirectory(at: directory) {
-            return size
-        }
-        return nil
+        // Filesystem paths are not URI strings: '#' and '%' in a directory
+        // name would otherwise become a fragment or an invalid escape.
+        fileManager.sizeOfDirectory(at: URL(fileURLWithPath: path, isDirectory: true))
     }
 }

@@ -296,5 +296,22 @@ final class DiskStorageTests: XCTestCase {
     }
   }
 
+
+  func testTotalSizeUsesFileURLForDirectoriesContainingURICharacters() throws {
+    let directory = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-size-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Cache # fragment %", directory: directory),
+      transformer: TransformerFactory.forData()
+    )
+    try disk.setObject(Data(repeating: 0x41, count: 8192), forKey: "payload")
+
+    let actualDirectory = URL(fileURLWithPath: disk.path, isDirectory: true)
+    let expected = try XCTUnwrap(fileManager.sizeOfDirectory(at: actualDirectory))
+    XCTAssertGreaterThan(expected, 0)
+    XCTAssertEqual(disk.totalSize, expected)
+  }
+
 }
 
