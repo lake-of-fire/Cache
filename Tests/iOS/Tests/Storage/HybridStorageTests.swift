@@ -291,4 +291,72 @@ final class HybridStorageTests: XCTestCase {
     storage.removeAllKeyObservers()
     XCTAssertTrue(storage.keyObservations.isEmpty)
   }
+
+  func testSupersededKeyObserverTokenCannotCancelReplacement() throws {
+    var oldEvents = 0
+    var currentEvents = 0
+    let predecessor = storage.addObserver(self, forKey: "reused") { _, _, _ in
+      oldEvents += 1
+    }
+    let successor = storage.addObserver(self, forKey: "reused") { _, _, _ in
+      currentEvents += 1
+    }
+
+    predecessor.cancel()
+    try storage.setObject(testObject, forKey: "reused")
+    XCTAssertEqual(oldEvents, 0)
+    XCTAssertEqual(currentEvents, 1)
+
+    successor.cancel()
+    try storage.setObject(testObject, forKey: "reused")
+    XCTAssertEqual(currentEvents, 1)
+  }
+
+  func testNamedDiskFilenameRemovalNotifiesTheRegisteredKey() throws {
+    let directory = fileManager.temporaryDirectory
+      .appendingPathComponent("named-observer-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, User>(
+      config: DiskConfig(name: "NamedDisk", directory: directory, keysAsFilenames: true),
+      transformer: TransformerFactory.forCodable(ofType: User.self)
+    )
+    let cache = HybridStorage(
+      memoryStorage: MemoryStorage<String, User>(config: MemoryConfig()),
+      diskStorage: disk
+    )
+    var changes = [KeyChange<User>]()
+    cache.addObserver(self, forKey: "entry.json") { _, _, change in
+      changes.append(change)
+    }
+
+    try disk.setObject(testObject, forKey: "entry.json")
+    try disk.removeObject(forKey: "entry.json")
+    XCTAssertEqual(changes, [.remove])
+  }
+
+  func testDiskRemovalDoesNotMatchUnrelatedKeyHashInDirectory() throws {
+    let watchedKey = "watched-key"
+    // The parent path contains the watched key's hash, but the removed file
+    // belongs to a different key. Substring-based matching falsely notified it.
+    let directory = fileManager.temporaryDirectory
+      .appendingPathComponent(MD5(watchedKey), isDirectory: true)
+      .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: directory.deletingLastPathComponent()) }
+    let disk = try DiskStorage<String, User>(
+      config: DiskConfig(name: "ScopedDisk", directory: directory),
+      transformer: TransformerFactory.forCodable(ofType: User.self)
+    )
+    let cache = HybridStorage(
+      memoryStorage: MemoryStorage<String, User>(config: MemoryConfig()),
+      diskStorage: disk
+    )
+    var removalCount = 0
+    cache.addObserver(self, forKey: watchedKey) { _, _, _ in
+      removalCount += 1
+    }
+
+    try disk.setObject(testObject, forKey: "different-key")
+    try disk.removeObject(forKey: "different-key")
+    XCTAssertEqual(removalCount, 0)
+  }
 }

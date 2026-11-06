@@ -7,6 +7,8 @@ public final class HybridStorage<Key: Hashable, Value> {
 
   private(set) var storageObservations = [UUID: (HybridStorage, StorageChange<Key>) -> Void]()
   private(set) var keyObservations = [Key: (HybridStorage, KeyChange<Value>) -> Void]()
+  // A token owns only the registration it created, not a later observer for the same key.
+  private var keyObservationIDs = [Key: UUID]()
 
   public init(memoryStorage: MemoryStorage<Key, Value>, diskStorage: DiskStorage<Key, Value>) {
     self.memoryStorage = memoryStorage
@@ -18,9 +20,14 @@ public final class HybridStorage<Key: Hashable, Value> {
   }
 
   private func handleRemovedObject(at path: String) {
-    notifyObserver(about: .remove) { key in
-      let fileName = diskStorage.makeFileName(for: key)
-      return path.contains(fileName)
+    // DiskStorage can use literal key filenames instead of hashed filenames.
+    // Comparing the complete path also prevents a cache directory or another
+    // key's filename from falsely matching a registered key.
+    let removedKeys = Array(keyObservations.keys).filter {
+      diskStorage.makeFilePath(for: $0) == path
+    }
+    for key in removedKeys {
+      notifyObserver(forKey: key, about: .remove)
     }
   }
 }
@@ -141,6 +148,8 @@ extension HybridStorage: KeyObservationRegistry {
     forKey key: Key,
     closure: @escaping (O, HybridStorage, KeyChange<Value>) -> Void
   ) -> ObservationToken {
+    let registrationID = UUID()
+    keyObservationIDs[key] = registrationID
     keyObservations[key] = { [weak self, weak observer] storage, change in
       guard let observer = observer else {
         self?.removeObserver(forKey: key)
@@ -151,25 +160,23 @@ extension HybridStorage: KeyObservationRegistry {
     }
 
     return ObservationToken { [weak self] in
-      self?.keyObservations.removeValue(forKey: key)
+      guard let self, self.keyObservationIDs[key] == registrationID else { return }
+      self.removeObserver(forKey: key)
     }
   }
 
   public func removeObserver(forKey key: Key) {
+    keyObservationIDs.removeValue(forKey: key)
     keyObservations.removeValue(forKey: key)
   }
 
   public func removeAllKeyObservers() {
+    keyObservationIDs.removeAll()
     keyObservations.removeAll()
   }
 
   private func notifyObserver(forKey key: Key, about change: KeyChange<Value>) {
     keyObservations[key]?(self, change)
-  }
-
-  private func notifyObserver(about change: KeyChange<Value>, whereKey closure: ((Key) -> Bool)) {
-    let observation = keyObservations.first { key, _ in closure(key) }?.value
-    observation?(self, change)
   }
 
   private func notifyKeyObservers(about change: KeyChange<Value>) {
