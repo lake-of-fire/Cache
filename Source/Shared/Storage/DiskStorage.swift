@@ -86,7 +86,7 @@ extension DiskStorage: StorageAware {
         let data = try transformer.toData(object)
         let filePath = makeFilePath(for: key)
         try createDirectory()
-        _ = fileManager.createFile(atPath: filePath, contents: data, attributes: nil)
+        try data.write(to: URL(fileURLWithPath: filePath), options: .atomic)
         try fileManager.setAttributes([.modificationDate: expiry.date], ofItemAtPath: filePath)
     }
     

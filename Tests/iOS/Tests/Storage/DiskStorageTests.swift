@@ -18,6 +18,44 @@ final class DiskStorageTests: XCTestCase {
     super.tearDown()
   }
 
+  func testSetObjectRejectsDirectoryAtCacheFilePath() throws {
+    let directory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "WriteFailure", directory: directory),
+      transformer: TransformerFactory.forData()
+    )
+    let destination = URL(fileURLWithPath: disk.makeFilePath(for: "entry"))
+    try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+    let sentinel = destination.appendingPathComponent("keep")
+    try Data("existing directory".utf8).write(to: sentinel)
+
+    XCTAssertThrowsError(try disk.setObject(Data("replacement".utf8), forKey: "entry"))
+    XCTAssertEqual(try Data(contentsOf: sentinel), Data("existing directory".utf8))
+  }
+
+  func testSuccessfulAtomicReplacementPreservesDataAndExpiry() throws {
+    let directory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Replacement", directory: directory),
+      transformer: TransformerFactory.forData()
+    )
+    let original = Data(repeating: 0x41, count: 4096)
+    let replacement = Data("new".utf8)
+    let expiry = Date(timeIntervalSince1970: 2_000_000_000)
+    try disk.setObject(original, forKey: "entry")
+    try disk.setObject(replacement, forKey: "entry", expiry: .date(expiry))
+
+    let reopened = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Replacement", directory: directory),
+      transformer: TransformerFactory.forData()
+    )
+    let entry = try reopened.entry(forKey: "entry")
+    XCTAssertEqual(entry.object, replacement)
+    XCTAssertEqual(entry.expiry.date.timeIntervalSince1970, expiry.timeIntervalSince1970, accuracy: 0.001)
+  }
+
   func testInit() {
     // Test that it creates cache directory
     let fileExist = fileManager.fileExists(atPath: storage.path)

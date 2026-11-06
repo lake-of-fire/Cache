@@ -64,8 +64,8 @@ extension HybridStorage: StorageAware {
       keyChange = .edit(before: try? self.object(forKey: key), after: object)
     }
 
-    memoryStorage.setObject(object, forKey: key, expiry: expiry)
     try diskStorage.setObject(object, forKey: key, expiry: expiry)
+    memoryStorage.setObject(object, forKey: key, expiry: expiry)
 
     if let change = keyChange {
       notifyObserver(forKey: key, about: change)

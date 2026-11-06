@@ -21,6 +21,63 @@ final class HybridStorageTests: XCTestCase {
     super.tearDown()
   }
 
+  func testFailedSerializationPreservesPreviousMemoryAndDiskValue() throws {
+    let directory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? fileManager.removeItem(at: directory) }
+    let transformer = Transformer<Data>(
+      toData: { value in
+        guard value != Data("rejected".utf8) else { throw StorageError.transformerFail }
+        return value
+      },
+      fromData: { $0 }
+    )
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "SerializationFailure", directory: directory),
+      transformer: transformer
+    )
+    let memory = MemoryStorage<String, Data>(config: MemoryConfig())
+    let cache = HybridStorage(memoryStorage: memory, diskStorage: disk)
+    let original = Data("original".utf8)
+    let expiry = Date(timeIntervalSince1970: 2_000_000_000)
+    try cache.setObject(original, forKey: "entry", expiry: .date(expiry))
+    var storageNotifications = 0
+    var keyNotifications = 0
+    cache.addStorageObserver(self) { _, _, _ in storageNotifications += 1 }
+    cache.addObserver(self, forKey: "entry") { _, _, _ in keyNotifications += 1 }
+
+    XCTAssertThrowsError(try cache.setObject(Data("rejected".utf8), forKey: "entry"))
+    XCTAssertEqual(try cache.object(forKey: "entry"), original)
+    XCTAssertEqual(try disk.object(forKey: "entry"), original)
+    XCTAssertEqual(try memory.entry(forKey: "entry").expiry.date, expiry)
+    XCTAssertEqual(storageNotifications, 0)
+    XCTAssertEqual(keyNotifications, 0)
+  }
+
+  func testFailedDiskWriteDoesNotPublishMemoryOrNotifications() throws {
+    let directory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "DiskFailure", directory: directory),
+      transformer: TransformerFactory.forData()
+    )
+    let memory = MemoryStorage<String, Data>(config: MemoryConfig())
+    let cache = HybridStorage(memoryStorage: memory, diskStorage: disk)
+    let destination = URL(fileURLWithPath: disk.makeFilePath(for: "entry"))
+    try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+    let sentinel = destination.appendingPathComponent("keep")
+    try Data("existing directory".utf8).write(to: sentinel)
+    var storageNotifications = 0
+    var keyNotifications = 0
+    cache.addStorageObserver(self) { _, _, _ in storageNotifications += 1 }
+    cache.addObserver(self, forKey: "entry") { _, _, _ in keyNotifications += 1 }
+
+    XCTAssertThrowsError(try cache.setObject(Data("unwritten".utf8), forKey: "entry"))
+    XCTAssertFalse(memory.objectExists(forKey: "entry"))
+    XCTAssertEqual(try Data(contentsOf: sentinel), Data("existing directory".utf8))
+    XCTAssertEqual(storageNotifications, 0)
+    XCTAssertEqual(keyNotifications, 0)
+  }
+
   func testSetObject() throws {
     try when("set to storage") {
       try storage.setObject(testObject, forKey: key)
