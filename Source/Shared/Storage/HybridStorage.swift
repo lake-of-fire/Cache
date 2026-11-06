@@ -152,7 +152,11 @@ extension HybridStorage: KeyObservationRegistry {
     keyObservationIDs[key] = registrationID
     keyObservations[key] = { [weak self, weak observer] storage, change in
       guard let observer = observer else {
-        self?.removeObserver(forKey: key)
+        // A notification can reenter and replace the key registration.
+        // The retired observer must not unregister that successor.
+        if let self, self.keyObservationIDs[key] == registrationID {
+          self.removeObserver(forKey: key)
+        }
         return
       }
 
