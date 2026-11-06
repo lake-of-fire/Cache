@@ -339,9 +339,8 @@ final class HybridStorageTests: XCTestCase {
     // The parent path contains the watched key's hash, but the removed file
     // belongs to a different key. Substring-based matching falsely notified it.
     let directory = fileManager.temporaryDirectory
-      .appendingPathComponent(MD5(watchedKey), isDirectory: true)
-      .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    defer { try? fileManager.removeItem(at: directory.deletingLastPathComponent()) }
+      .appendingPathComponent("hash-observer-" + UUID().uuidString + "-" + MD5(watchedKey), isDirectory: true)
+    defer { try? fileManager.removeItem(at: directory) }
     let disk = try DiskStorage<String, User>(
       config: DiskConfig(name: "ScopedDisk", directory: directory),
       transformer: TransformerFactory.forCodable(ofType: User.self)
