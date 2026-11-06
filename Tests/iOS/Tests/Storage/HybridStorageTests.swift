@@ -358,4 +358,28 @@ final class HybridStorageTests: XCTestCase {
     try disk.removeObject(forKey: "different-key")
     XCTAssertEqual(removalCount, 0)
   }
+
+  func testExpiredObserverCallbackCannotRemoveReplacementRegistration() throws {
+    var oldObserver: NSObject? = NSObject()
+    let predecessor = storage.addObserver(oldObserver!, forKey: "reentrant") { _, _, _ in
+      XCTFail("Retired observer must not receive events")
+    }
+    let retiredCallback = try XCTUnwrap(storage.keyObservations["reentrant"])
+    oldObserver = nil
+
+    var delivered = 0
+    let successor = storage.addObserver(self, forKey: "reentrant") { _, _, _ in
+      delivered += 1
+    }
+    retiredCallback(storage, .remove)
+    XCTAssertEqual(storage.keyObservations.count, 1)
+
+    try storage.setObject(testObject, forKey: "reentrant")
+    XCTAssertEqual(delivered, 1)
+    predecessor.cancel()
+    XCTAssertEqual(storage.keyObservations.count, 1)
+    successor.cancel()
+    XCTAssertTrue(storage.keyObservations.isEmpty)
+  }
+
 }
