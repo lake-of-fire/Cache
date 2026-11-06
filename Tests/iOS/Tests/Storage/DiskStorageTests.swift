@@ -313,5 +313,27 @@ final class DiskStorageTests: XCTestCase {
     XCTAssertEqual(disk.totalSize, expected)
   }
 
+
+  func testExpiredHiddenLiteralFilenameIsRemovedDuringDiskSweep() throws {
+    let root = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-hidden-expiry-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Named", directory: root, keysAsFilenames: true),
+      transformer: TransformerFactory.forData()
+    )
+    let expired = Expiry.date(Date().addingTimeInterval(-3600))
+    try disk.setObject(Data("hidden".utf8), forKey: ".hidden", expiry: expired)
+    try disk.setObject(Data("visible".utf8), forKey: "visible", expiry: expired)
+    let hiddenPath = disk.makeFilePath(for: ".hidden")
+    let visiblePath = disk.makeFilePath(for: "visible")
+    XCTAssertTrue(fileManager.fileExists(atPath: hiddenPath))
+    XCTAssertTrue(fileManager.fileExists(atPath: visiblePath))
+
+    try disk.removeExpiredObjects()
+    XCTAssertFalse(fileManager.fileExists(atPath: hiddenPath))
+    XCTAssertFalse(fileManager.fileExists(atPath: visiblePath))
+  }
+
 }
 

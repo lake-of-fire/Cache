@@ -114,7 +114,10 @@ extension DiskStorage: StorageAware {
         let fileEnumerator = fileManager.enumerator(
             at: storageURL,
             includingPropertiesForKeys: resourceKeys,
-            options: .skipsHiddenFiles,
+            // Literal-filename caches may legitimately store dot-prefixed
+            // keys. Skipping hidden files makes their expiry and size limits
+            // unenforceable.
+            options: [],
             errorHandler: nil
         )
         
