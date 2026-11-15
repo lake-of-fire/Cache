@@ -15,6 +15,12 @@ final public class DiskStorage<Key: Hashable, Value> {
     /// The closure to be called when single file has been removed
     var onRemove: ((String) -> Void)?
     
+    // Per-storage enumeration boundary; configure before sharing the storage.
+    // Nil preserves FileManager's resource prefetch, options and error handling.
+    typealias EnumerationFactory = (URL, [URLResourceKey]?, FileManager.DirectoryEnumerationOptions,
+                                    ((URL, Swift.Error) -> Bool)?) -> NSEnumerator?
+    var enumerationFactory: EnumerationFactory?
+
     private let acquireExecutionLease: CacheStorageExecutionProtection.Acquisition?
     private let transformer: Transformer<Value>
     private let hasher = Hasher.constantAccrossExecutions()
@@ -138,7 +144,7 @@ extension DiskStorage: StorageAware {
             var filesToDelete = [URL]()
             var totalSize: UInt = 0
             try checkpoint()
-            let fileEnumerator = fileManager.enumerator(
+            let fileEnumerator = makeEnumerator(
                 at: storageURL,
                 includingPropertiesForKeys: resourceKeys,
                 options: .skipsHiddenFiles,
@@ -320,6 +326,7 @@ public extension DiskStorage {
             acquireExecutionLease: acquireExecutionLease
         )
         
+        storage.enumerationFactory = enumerationFactory
         return storage
     }
 }
@@ -329,7 +336,7 @@ public extension DiskStorage {
     var totalSize: Int? {
         try? withExecutionProtection { checkpoint -> Int? in
             guard let directory = URL(string: self.path),
-                  let enumerator = fileManager.enumerator(at: directory, includingPropertiesForKeys: [], options: [], errorHandler: { _, _ in false }) else { return nil }
+                  let enumerator = makeEnumerator(at: directory, includingPropertiesForKeys: [], options: [], errorHandler: { _, _ in false }) else { return nil }
             var size = 0
             while true {
                 try checkpoint()
@@ -344,6 +351,16 @@ public extension DiskStorage {
 }
 
 private extension DiskStorage {
+    func makeEnumerator(at url: URL, includingPropertiesForKeys keys: [URLResourceKey]?,
+                        options: FileManager.DirectoryEnumerationOptions,
+                        errorHandler: ((URL, Swift.Error) -> Bool)?) -> NSEnumerator? {
+        if let enumerationFactory {
+            return enumerationFactory(url, keys, options, errorHandler)
+        }
+        return fileManager.enumerator(at: url, includingPropertiesForKeys: keys,
+                                      options: options, errorHandler: errorHandler)
+    }
+
     func withExecutionProtection<Result>(_ operation: (() throws -> Void) throws -> Result) throws -> Result {
         try CacheStorageExecutionProtection.withLease(acquisition: acquireExecutionLease, operation: operation)
     }

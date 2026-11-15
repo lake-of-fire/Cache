@@ -86,26 +86,13 @@ final class CacheStorageExecutionProtectionTests: XCTestCase {
         }
     }
 
-    private final class InstrumentedEnumerator: FileManager.DirectoryEnumerator {
+    private final class InstrumentedEnumerator: NSEnumerator {
         let probe: EnumerationProbe
         init(probe: EnumerationProbe) {
             self.probe = probe
             super.init()
         }
         override func nextObject() -> Any? { probe.nextObject() }
-    }
-
-    private final class EnumeratingFileManager: FileManager, @unchecked Sendable {
-        let probe: EnumerationProbe
-        init(probe: EnumerationProbe) {
-            self.probe = probe
-            super.init()
-        }
-        override func enumerator(at url: URL, includingPropertiesForKeys keys: [URLResourceKey]?,
-                                 options mask: FileManager.DirectoryEnumerationOptions = [],
-                                 errorHandler handler: ((URL, Swift.Error) -> Bool)? = nil) -> FileManager.DirectoryEnumerator? {
-            InstrumentedEnumerator(probe: probe)
-        }
     }
 
     private var directory: URL!
@@ -129,8 +116,8 @@ final class CacheStorageExecutionProtectionTests: XCTestCase {
         let probe = EnumerationProbe()
         let storage = try DiskStorage<String, Data>(
             config: DiskConfig(name: "execution", directory: directory),
-            fileManager: EnumeratingFileManager(probe: probe),
             transformer: TransformerFactory.forData(), acquireExecutionLease: { probe.acquire() })
+        storage.enumerationFactory = { _, _, _, _ in InstrumentedEnumerator(probe: probe) }
         try storage.setObject(Data([1]), forKey: "first", expiry: .date(.distantPast))
         try storage.setObject(Data([2]), forKey: "second", expiry: .date(.distantPast))
         probe.prepare(urls: ["first", "second"].map { URL(fileURLWithPath: storage.makeFilePath(for: $0)) })
@@ -150,14 +137,15 @@ final class CacheStorageExecutionProtectionTests: XCTestCase {
         let probe = EnumerationProbe()
         let storage = try DiskStorage<String, Data>(
             config: DiskConfig(name: "execution", directory: directory),
-            fileManager: EnumeratingFileManager(probe: probe),
             transformer: TransformerFactory.forData(), acquireExecutionLease: { probe.acquire() })
+        storage.enumerationFactory = { _, _, _, _ in InstrumentedEnumerator(probe: probe) }
         try storage.setObject(Data([1]), forKey: "first")
         try storage.setObject(Data([2]), forKey: "second")
         probe.prepare(urls: ["first", "second"].map { URL(fileURLWithPath: storage.makeFilePath(for: $0)) })
+        let transformed = storage.transform(transformer: TransformerFactory.forData())
         let releasesBefore = probe.observations.releases
 
-        XCTAssertNil(storage.totalSize)
+        XCTAssertNil(transformed.totalSize)
 
         XCTAssertTrue(probe.observations.expired)
         XCTAssertEqual(probe.observations.advances, 1)
