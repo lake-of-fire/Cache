@@ -21,6 +21,63 @@ final class HybridStorageTests: XCTestCase {
     super.tearDown()
   }
 
+  func testFailedSerializationPreservesPreviousMemoryAndDiskValue() throws {
+    let directory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? fileManager.removeItem(at: directory) }
+    let transformer = Transformer<Data>(
+      toData: { value in
+        guard value != Data("rejected".utf8) else { throw StorageError.transformerFail }
+        return value
+      },
+      fromData: { $0 }
+    )
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "SerializationFailure", directory: directory),
+      transformer: transformer
+    )
+    let memory = MemoryStorage<String, Data>(config: MemoryConfig())
+    let cache = HybridStorage(memoryStorage: memory, diskStorage: disk)
+    let original = Data("original".utf8)
+    let expiry = Date(timeIntervalSince1970: 2_000_000_000)
+    try cache.setObject(original, forKey: "entry", expiry: .date(expiry))
+    var storageNotifications = 0
+    var keyNotifications = 0
+    cache.addStorageObserver(self) { _, _, _ in storageNotifications += 1 }
+    cache.addObserver(self, forKey: "entry") { _, _, _ in keyNotifications += 1 }
+
+    XCTAssertThrowsError(try cache.setObject(Data("rejected".utf8), forKey: "entry"))
+    XCTAssertEqual(try cache.object(forKey: "entry"), original)
+    XCTAssertEqual(try disk.object(forKey: "entry"), original)
+    XCTAssertEqual(try memory.entry(forKey: "entry").expiry.date, expiry)
+    XCTAssertEqual(storageNotifications, 0)
+    XCTAssertEqual(keyNotifications, 0)
+  }
+
+  func testFailedDiskWriteDoesNotPublishMemoryOrNotifications() throws {
+    let directory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "DiskFailure", directory: directory),
+      transformer: TransformerFactory.forData()
+    )
+    let memory = MemoryStorage<String, Data>(config: MemoryConfig())
+    let cache = HybridStorage(memoryStorage: memory, diskStorage: disk)
+    let destination = URL(fileURLWithPath: disk.makeFilePath(for: "entry"))
+    try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+    let sentinel = destination.appendingPathComponent("keep")
+    try Data("existing directory".utf8).write(to: sentinel)
+    var storageNotifications = 0
+    var keyNotifications = 0
+    cache.addStorageObserver(self) { _, _, _ in storageNotifications += 1 }
+    cache.addObserver(self, forKey: "entry") { _, _, _ in keyNotifications += 1 }
+
+    XCTAssertThrowsError(try cache.setObject(Data("unwritten".utf8), forKey: "entry"))
+    XCTAssertFalse(memory.objectExists(forKey: "entry"))
+    XCTAssertEqual(try Data(contentsOf: sentinel), Data("existing directory".utf8))
+    XCTAssertEqual(storageNotifications, 0)
+    XCTAssertEqual(keyNotifications, 0)
+  }
+
   func testSetObject() throws {
     try when("set to storage") {
       try storage.setObject(testObject, forKey: key)
@@ -234,4 +291,121 @@ final class HybridStorageTests: XCTestCase {
     storage.removeAllKeyObservers()
     XCTAssertTrue(storage.keyObservations.isEmpty)
   }
+
+  func testSupersededKeyObserverTokenCannotCancelReplacement() throws {
+    var oldEvents = 0
+    var currentEvents = 0
+    let predecessor = storage.addObserver(self, forKey: "reused") { _, _, _ in
+      oldEvents += 1
+    }
+    let successor = storage.addObserver(self, forKey: "reused") { _, _, _ in
+      currentEvents += 1
+    }
+
+    predecessor.cancel()
+    try storage.setObject(testObject, forKey: "reused")
+    XCTAssertEqual(oldEvents, 0)
+    XCTAssertEqual(currentEvents, 1)
+
+    successor.cancel()
+    try storage.setObject(testObject, forKey: "reused")
+    XCTAssertEqual(currentEvents, 1)
+  }
+
+  func testNamedDiskFilenameRemovalNotifiesTheRegisteredKey() throws {
+    let directory = fileManager.temporaryDirectory
+      .appendingPathComponent("named-observer-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, User>(
+      config: DiskConfig(name: "NamedDisk", directory: directory, keysAsFilenames: true),
+      transformer: TransformerFactory.forCodable(ofType: User.self)
+    )
+    let cache = HybridStorage(
+      memoryStorage: MemoryStorage<String, User>(config: MemoryConfig()),
+      diskStorage: disk
+    )
+    var changes = [KeyChange<User>]()
+    cache.addObserver(self, forKey: "entry.json") { _, _, change in
+      changes.append(change)
+    }
+
+    try disk.setObject(testObject, forKey: "entry.json")
+    try disk.removeObject(forKey: "entry.json")
+    XCTAssertEqual(changes, [.remove])
+  }
+
+  func testDiskRemovalDoesNotMatchUnrelatedKeyHashInDirectory() throws {
+    let watchedKey = "watched-key"
+    // The parent path contains the watched key's hash, but the removed file
+    // belongs to a different key. Substring-based matching falsely notified it.
+    let directory = fileManager.temporaryDirectory
+      .appendingPathComponent("hash-observer-" + UUID().uuidString + "-" + MD5(watchedKey), isDirectory: true)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, User>(
+      config: DiskConfig(name: "ScopedDisk", directory: directory),
+      transformer: TransformerFactory.forCodable(ofType: User.self)
+    )
+    let cache = HybridStorage(
+      memoryStorage: MemoryStorage<String, User>(config: MemoryConfig()),
+      diskStorage: disk
+    )
+    var removalCount = 0
+    cache.addObserver(self, forKey: watchedKey) { _, _, _ in
+      removalCount += 1
+    }
+
+    try disk.setObject(testObject, forKey: "different-key")
+    try disk.removeObject(forKey: "different-key")
+    XCTAssertEqual(removalCount, 0)
+  }
+
+  func testExpiredObserverCallbackCannotRemoveReplacementRegistration() throws {
+    var oldObserver: NSObject? = NSObject()
+    let predecessor = storage.addObserver(oldObserver!, forKey: "reentrant") { _, _, _ in
+      XCTFail("Retired observer must not receive events")
+    }
+    let retiredCallback = try XCTUnwrap(storage.keyObservations["reentrant"])
+    oldObserver = nil
+
+    var delivered = 0
+    let successor = storage.addObserver(self, forKey: "reentrant") { _, _, _ in
+      delivered += 1
+    }
+    retiredCallback(storage, .remove)
+    XCTAssertEqual(storage.keyObservations.count, 1)
+
+    try storage.setObject(testObject, forKey: "reentrant")
+    XCTAssertEqual(delivered, 1)
+    predecessor.cancel()
+    XCTAssertEqual(storage.keyObservations.count, 1)
+    successor.cancel()
+    XCTAssertTrue(storage.keyObservations.isEmpty)
+  }
+
+
+  func testFailedDiskRemoveAllKeepsInMemoryObjectsAndDoesNotNotify() throws {
+    let root = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-remove-all-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let memory = MemoryStorage<String, User>(config: MemoryConfig())
+    let disk = try DiskStorage<String, User>(
+      config: DiskConfig(name: "RemovalFailure", directory: root),
+      transformer: TransformerFactory.forCodable(ofType: User.self)
+    )
+    let cache = HybridStorage(memoryStorage: memory, diskStorage: disk)
+    try cache.setObject(testObject, forKey: "kept")
+    var notificationCount = 0
+    let token = cache.addStorageObserver(self) { _, _, _ in
+      notificationCount += 1
+    }
+    defer { token.cancel() }
+
+    // Simulate external deletion of the backing directory. The disk
+    // operation now fails, but the in-memory copy is still valid.
+    try fileManager.removeItem(atPath: disk.path)
+    XCTAssertThrowsError(try cache.removeAll())
+    XCTAssertEqual(try memory.object(forKey: "kept"), testObject)
+    XCTAssertEqual(notificationCount, 0)
+  }
+
 }

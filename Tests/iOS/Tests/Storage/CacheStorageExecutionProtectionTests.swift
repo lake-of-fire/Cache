@@ -5,6 +5,21 @@ import XCTest
 final class CacheStorageExecutionProtectionTests: XCTestCase {
     private enum Failure: Error { case denied, expired, transform }
 
+    private final class FilePathProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedPath: String?
+        var path: String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedPath
+        }
+        func set(_ path: String) {
+            lock.lock()
+            storedPath = path
+            lock.unlock()
+        }
+    }
+
     private final class Policy: @unchecked Sendable {
         private let lock = NSLock()
         private var denied = false
@@ -34,19 +49,6 @@ final class CacheStorageExecutionProtectionTests: XCTestCase {
             }, release: { [self] in
                 locked { releases += 1; active -= 1 }
             })
-        }
-    }
-
-    private final class ExpiringFileManager: FileManager, @unchecked Sendable {
-        let afterCreate: @Sendable () -> Void
-        init(afterCreate: @escaping @Sendable () -> Void) {
-            self.afterCreate = afterCreate
-            super.init()
-        }
-        override func createFile(atPath path: String, contents data: Data?, attributes attr: [FileAttributeKey: Any]? = nil) -> Bool {
-            let result = super.createFile(atPath: path, contents: data, attributes: attr)
-            afterCreate()
-            return result
         }
     }
 
@@ -206,12 +208,25 @@ final class CacheStorageExecutionProtectionTests: XCTestCase {
 
     func testExpiryAfterFileCreationStopsExpiryAttributeWrite() throws {
         let policy = Policy()
-        let manager = ExpiringFileManager { policy.expire() }
+        let expectedFilePath = FilePathProbe()
         let storage = try DiskStorage<String, Data>(
-            config: DiskConfig(name: "execution", directory: directory), fileManager: manager,
-            transformer: TransformerFactory.forData(), acquireExecutionLease: { try policy.acquire() })
+            config: DiskConfig(name: "execution", directory: directory),
+            transformer: TransformerFactory.forData(),
+            acquireExecutionLease: {
+                let lease = try policy.acquire()
+                return CacheStorageExecutionLease(checkpoint: {
+                    try lease?.checkpoint()
+                    if let path = expectedFilePath.path, FileManager.default.fileExists(atPath: path) {
+                        policy.expire()
+                        try lease?.checkpoint()
+                    }
+                }, release: { lease?.release() })
+            })
+        expectedFilePath.set(storage.makeFilePath(for: "key"))
         XCTAssertThrowsError(try storage.setObject(Data([1]), forKey: "key", expiry: .date(.distantPast)))
-        let attributes = try FileManager.default.attributesOfItem(atPath: storage.makeFilePath(for: "key"))
+        let filePath = try XCTUnwrap(expectedFilePath.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: filePath))
+        let attributes = try FileManager.default.attributesOfItem(atPath: filePath)
         let modified = try XCTUnwrap(attributes[.modificationDate] as? Date)
         XCTAssertGreaterThan(modified, Date().addingTimeInterval(-60))
         XCTAssertEqual(policy.counts.acquired, policy.counts.released)

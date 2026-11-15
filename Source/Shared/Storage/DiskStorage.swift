@@ -109,12 +109,12 @@ extension DiskStorage: StorageAware {
             let filePath = makeFilePath(for: key)
             try createDirectory(checkpoint: checkpoint)
             try checkpoint()
-            _ = fileManager.createFile(atPath: filePath, contents: data, attributes: nil)
+            try data.write(to: URL(fileURLWithPath: filePath, isDirectory: false), options: .atomic)
             try checkpoint()
             try fileManager.setAttributes([.modificationDate: expiry.date], ofItemAtPath: filePath)
         }
     }
-    
+
     public func removeObject(forKey key: Key) throws {
         return try withExecutionProtection { checkpoint in
             let filePath = makeFilePath(for: key)
@@ -147,14 +147,16 @@ extension DiskStorage: StorageAware {
             let fileEnumerator = makeEnumerator(
                 at: storageURL,
                 includingPropertiesForKeys: resourceKeys,
-                options: .skipsHiddenFiles,
+                // Literal-filename caches may contain dot-prefixed keys; they
+                // still participate in expiry and size enforcement.
+                options: [],
                 errorHandler: nil
             )
-            
+
             guard let fileEnumerator else {
                 throw Error.fileEnumeratorFailed
             }
-            
+
             while true {
                 try checkpoint()
                 guard let object = fileEnumerator.nextObject() else { break }
@@ -164,30 +166,30 @@ extension DiskStorage: StorageAware {
                 guard resourceValues.isDirectory != true else {
                     continue
                 }
-                
+
                 if let expiryDate = resourceValues.contentModificationDate, expiryDate.inThePast {
                     filesToDelete.append(url)
                     continue
                 }
-                
+
                 if let fileSize = resourceValues.totalFileAllocatedSize {
                     totalSize += UInt(fileSize)
                     resourceObjects.append((url: url, resourceValues: resourceValues))
                 }
             }
-            
+
             // Remove expired objects
             for url in filesToDelete {
                 try checkpoint()
                 try fileManager.removeItem(at: url)
                 onRemove?(url.path)
             }
-            
+
             // Remove objects if storage size exceeds max size
             try removeResourceObjects(resourceObjects, totalSize: totalSize, checkpoint: checkpoint)
         }
     }
-    
+
     public func removeInMemoryObject(forKey key: Key) throws { }
 }
 
@@ -236,8 +238,13 @@ extension DiskStorage {
      - Returns: A string path based on key
      */
     func makeFilePath(for key: Key) -> String {
-        if config.keysAsFilenames, let keyStr = key as? String {
-            return "\(path)/\(key)"
+        if config.keysAsFilenames, let keyStr = key as? String,
+           !keyStr.isEmpty, keyStr != ".", keyStr != "..",
+           !keyStr.contains("/"), !keyStr.contains("\\"),
+           !keyStr.unicodeScalars.contains(where: { $0.value == 0 }) {
+            // Only a single path component may be a literal cache filename.
+            // Unsafe names take the deterministic hashed path, never a parent.
+            return "\(path)/\(keyStr)"
         }
         return "\(path)/\(makeFileName(for: key))"
     }
@@ -335,8 +342,8 @@ public extension DiskStorage {
     /// Calculates the total size of the cache directory in bytes.
     var totalSize: Int? {
         try? withExecutionProtection { checkpoint -> Int? in
-            guard let directory = URL(string: self.path),
-                  let enumerator = makeEnumerator(at: directory, includingPropertiesForKeys: [], options: [], errorHandler: { _, _ in false }) else { return nil }
+            let directory = URL(fileURLWithPath: self.path, isDirectory: true)
+            guard let enumerator = makeEnumerator(at: directory, includingPropertiesForKeys: [], options: [], errorHandler: { _, _ in false }) else { return nil }
             var size = 0
             while true {
                 try checkpoint()

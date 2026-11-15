@@ -18,6 +18,44 @@ final class DiskStorageTests: XCTestCase {
     super.tearDown()
   }
 
+  func testSetObjectRejectsDirectoryAtCacheFilePath() throws {
+    let directory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "WriteFailure", directory: directory),
+      transformer: TransformerFactory.forData()
+    )
+    let destination = URL(fileURLWithPath: disk.makeFilePath(for: "entry"))
+    try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+    let sentinel = destination.appendingPathComponent("keep")
+    try Data("existing directory".utf8).write(to: sentinel)
+
+    XCTAssertThrowsError(try disk.setObject(Data("replacement".utf8), forKey: "entry"))
+    XCTAssertEqual(try Data(contentsOf: sentinel), Data("existing directory".utf8))
+  }
+
+  func testSuccessfulAtomicReplacementPreservesDataAndExpiry() throws {
+    let directory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Replacement", directory: directory),
+      transformer: TransformerFactory.forData()
+    )
+    let original = Data(repeating: 0x41, count: 4096)
+    let replacement = Data("new".utf8)
+    let expiry = Date(timeIntervalSince1970: 2_000_000_000)
+    try disk.setObject(original, forKey: "entry")
+    try disk.setObject(replacement, forKey: "entry", expiry: .date(expiry))
+
+    let reopened = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Replacement", directory: directory),
+      transformer: TransformerFactory.forData()
+    )
+    let entry = try reopened.entry(forKey: "entry")
+    XCTAssertEqual(entry.object, replacement)
+    XCTAssertEqual(entry.expiry.date.timeIntervalSince1970, expiry.timeIntervalSince1970, accuracy: 0.001)
+  }
+
   func testInit() {
     // Test that it creates cache directory
     let fileExist = fileManager.fileExists(atPath: storage.path)
@@ -215,5 +253,106 @@ final class DiskStorageTests: XCTestCase {
     let filePath = "\(storage.path)/\(storage.makeFileName(for: key))"
     XCTAssertEqual(storage.makeFilePath(for: key), filePath)
   }
+
+  func testLiteralKeyModeCannotEscapeItsCacheDirectory() throws {
+    let root = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-path-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Named", directory: root, keysAsFilenames: true),
+      transformer: TransformerFactory.forData()
+    )
+    let cacheDirectory = URL(fileURLWithPath: disk.path, isDirectory: true).standardizedFileURL
+    let outside = root.appendingPathComponent("outside.bin")
+    let sentinel = Data("not a cache entry".utf8)
+    try sentinel.write(to: outside)
+
+    for key in ["../outside.bin", "../../other.bin", "a/b", "a\\b", "..", ".", "", "nul\u{0}key"] {
+      let filePath = URL(fileURLWithPath: disk.makeFilePath(for: key))
+      XCTAssertEqual(filePath.deletingLastPathComponent().standardizedFileURL,
+                     cacheDirectory, key)
+      let payload = Data(("value for " + key).utf8)
+      try disk.setObject(payload, forKey: key)
+      XCTAssertEqual(try disk.object(forKey: key), payload, key)
+      XCTAssertEqual(try Data(contentsOf: outside), sentinel, key)
+      try disk.removeObject(forKey: key)
+      XCTAssertEqual(try Data(contentsOf: outside), sentinel, key)
+    }
+  }
+
+  func testLiteralKeyModePreservesOrdinaryFilenameCompatibility() throws {
+    let root = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-safe-names-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Named", directory: root, keysAsFilenames: true),
+      transformer: TransformerFactory.forData()
+    )
+
+    for key in ["plain", "chapter.html", "日本語.txt", ".hidden"] {
+      XCTAssertEqual(disk.makeFilePath(for: key), disk.path + "/" + key)
+      try disk.setObject(Data(key.utf8), forKey: key)
+      XCTAssertEqual(try disk.object(forKey: key), Data(key.utf8))
+    }
+  }
+
+
+  func testTotalSizeUsesFileURLForDirectoriesContainingURICharacters() throws {
+    let directory = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-size-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: directory) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Cache # fragment %", directory: directory),
+      transformer: TransformerFactory.forData()
+    )
+    try disk.setObject(Data(repeating: 0x41, count: 8192), forKey: "payload")
+
+    let actualDirectory = URL(fileURLWithPath: disk.path, isDirectory: true)
+    let expected = try XCTUnwrap(fileManager.sizeOfDirectory(at: actualDirectory))
+    XCTAssertGreaterThan(expected, 0)
+    XCTAssertEqual(disk.totalSize, expected)
+  }
+
+
+  func testExpiredHiddenLiteralFilenameIsRemovedDuringDiskSweep() throws {
+    let root = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-hidden-expiry-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Named", directory: root, keysAsFilenames: true),
+      transformer: TransformerFactory.forData()
+    )
+    let expired = Expiry.date(Date().addingTimeInterval(-3600))
+    try disk.setObject(Data("hidden".utf8), forKey: ".hidden", expiry: expired)
+    try disk.setObject(Data("visible".utf8), forKey: "visible", expiry: expired)
+    let hiddenPath = disk.makeFilePath(for: ".hidden")
+    let visiblePath = disk.makeFilePath(for: "visible")
+    XCTAssertTrue(fileManager.fileExists(atPath: hiddenPath))
+    XCTAssertTrue(fileManager.fileExists(atPath: visiblePath))
+
+    try disk.removeExpiredObjects()
+    XCTAssertFalse(fileManager.fileExists(atPath: hiddenPath))
+    XCTAssertFalse(fileManager.fileExists(atPath: visiblePath))
+  }
+
+  func testNonexpiredHiddenLiteralFilenameCountsTowardDiskSizeLimit() throws {
+    let root = fileManager.temporaryDirectory
+      .appendingPathComponent("cache-hidden-size-" + UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let disk = try DiskStorage<String, Data>(
+      config: DiskConfig(name: "Named", maxSize: 1024, directory: root, keysAsFilenames: true),
+      transformer: TransformerFactory.forData()
+    )
+    let future = Date().addingTimeInterval(24 * 60 * 60)
+    try disk.setObject(Data(repeating: 0x41, count: 64 * 1024),
+                       forKey: ".hidden", expiry: .date(future))
+    let hiddenPath = disk.makeFilePath(for: ".hidden")
+    XCTAssertTrue(fileManager.fileExists(atPath: hiddenPath))
+    XCTAssertGreaterThan(try disk.entry(forKey: ".hidden").expiry.date, Date())
+
+    try disk.removeExpiredObjects()
+    XCTAssertFalse(fileManager.fileExists(atPath: hiddenPath))
+  }
+
 }
 
