@@ -15,11 +15,21 @@ final public class DiskStorage<Key: Hashable, Value> {
     /// The closure to be called when single file has been removed
     var onRemove: ((String) -> Void)?
     
+    private let acquireExecutionLease: CacheStorageExecutionProtection.Acquisition?
     private let transformer: Transformer<Value>
     private let hasher = Hasher.constantAccrossExecutions()
     
     // MARK: - Initialization
-    public convenience init(config: DiskConfig, fileManager: FileManager = FileManager.default, transformer: Transformer<Value>) throws {
+    public convenience init(config: DiskConfig, fileManager: FileManager = FileManager.default, transformer: Transformer<Value>, acquireExecutionLease: CacheStorageExecutionProtection.Acquisition? = nil) throws {
+        let execution: CacheStorageExecutionLease?
+        if let acquireExecutionLease {
+            execution = try acquireExecutionLease()
+        } else {
+            execution = try CacheStorageExecutionProtection.acquire()
+        }
+        defer { execution?.release() }
+        let checkpoint: () throws -> Void = { try execution?.checkpoint() }
+        try checkpoint()
         let url: URL
         if let directory = config.directory {
             url = directory
@@ -35,18 +45,18 @@ final public class DiskStorage<Key: Hashable, Value> {
         // path
         let path = url.appendingPathComponent(config.name, isDirectory: true).path
         
-        self.init(config: config, fileManager: fileManager, path: path, transformer: transformer)
+        self.init(config: config, fileManager: fileManager, path: path, transformer: transformer, acquireExecutionLease: acquireExecutionLease)
         
-        try createDirectory()
+        try createDirectory(checkpoint: checkpoint)
         
         if let protectionType = config.protectionType {
-            try setDirectoryAttributes([
-                FileAttributeKey.protectionKey: protectionType
-            ])
+            try checkpoint()
+            try fileManager.setAttributes([FileAttributeKey.protectionKey: protectionType], ofItemAtPath: path)
         }
     }
     
-    public required init(config: DiskConfig, fileManager: FileManager = FileManager.default, path: String, transformer: Transformer<Value>) {
+    public required init(config: DiskConfig, fileManager: FileManager = FileManager.default, path: String, transformer: Transformer<Value>, acquireExecutionLease: CacheStorageExecutionProtection.Acquisition? = nil) {
+        self.acquireExecutionLease = acquireExecutionLease
         self.config = config
         self.fileManager = fileManager
         self.path = path
@@ -60,93 +70,116 @@ extension DiskStorage: StorageAware {
     public var allObjects: [Value] { [] }
     
     public func entry(forKey key: Key) throws -> Entry<Value> {
-        let filePath = makeFilePath(for: key)
-        let fileURL = URL(fileURLWithPath: filePath, isDirectory: false)
-        
-        let object: Value
-        if let fromFile = transformer.fromFile {
-            // Let the Transformer do direct on-disk MD5, memory-mapping, etc.
-            object = try fromFile(fileURL)
-        } else {
-            // Fallback to reading all data into memory
-            let data = try Data(contentsOf: fileURL)
-            object = try transformer.fromData(data)
+        return try withExecutionProtection { checkpoint in
+            let filePath = makeFilePath(for: key)
+            let fileURL = URL(fileURLWithPath: filePath, isDirectory: false)
+            
+            try checkpoint()
+            let object: Value
+            if let fromFile = transformer.fromFile {
+                // Let the Transformer do direct on-disk MD5, memory-mapping, etc.
+                object = try fromFile(fileURL)
+            } else {
+                // Fallback to reading all data into memory
+                let data = try Data(contentsOf: fileURL)
+                object = try transformer.fromData(data)
+            }
+            
+            try checkpoint()
+            let attributes = try fileManager.attributesOfItem(atPath: filePath)
+            guard let date = attributes[.modificationDate] as? Date else {
+                throw StorageError.malformedFileAttributes
+            }
+            
+            return Entry(object: object, expiry: Expiry.date(date), filePath: filePath)
         }
-        
-        let attributes = try fileManager.attributesOfItem(atPath: filePath)
-        guard let date = attributes[.modificationDate] as? Date else {
-            throw StorageError.malformedFileAttributes
-        }
-        
-        return Entry(object: object, expiry: Expiry.date(date), filePath: filePath)
     }
     
     public func setObject(_ object: Value, forKey key: Key, expiry: Expiry? = nil) throws {
-        let expiry = expiry ?? config.expiry
-        let data = try transformer.toData(object)
-        let filePath = makeFilePath(for: key)
-        try createDirectory()
-        _ = fileManager.createFile(atPath: filePath, contents: data, attributes: nil)
-        try fileManager.setAttributes([.modificationDate: expiry.date], ofItemAtPath: filePath)
+        return try withExecutionProtection { checkpoint in
+            let expiry = expiry ?? config.expiry
+            let data = try transformer.toData(object)
+            try checkpoint()
+            let filePath = makeFilePath(for: key)
+            try createDirectory(checkpoint: checkpoint)
+            try checkpoint()
+            _ = fileManager.createFile(atPath: filePath, contents: data, attributes: nil)
+            try checkpoint()
+            try fileManager.setAttributes([.modificationDate: expiry.date], ofItemAtPath: filePath)
+        }
     }
     
     public func removeObject(forKey key: Key) throws {
-        let filePath = makeFilePath(for: key)
-        try fileManager.removeItem(atPath: filePath)
-        onRemove?(filePath)
+        return try withExecutionProtection { checkpoint in
+            let filePath = makeFilePath(for: key)
+            try checkpoint()
+            try fileManager.removeItem(atPath: filePath)
+            onRemove?(filePath)
+        }
     }
     
     public func removeAll() throws {
-        try fileManager.removeItem(atPath: path)
-        try createDirectory()
+        return try withExecutionProtection { checkpoint in
+            try checkpoint()
+            try fileManager.removeItem(atPath: path)
+            try createDirectory(checkpoint: checkpoint)
+        }
     }
     
     public func removeExpiredObjects() throws {
-        let storageURL = URL(fileURLWithPath: path, isDirectory: true)
-        let resourceKeys: [URLResourceKey] = [
-            .isDirectoryKey,
-            .contentModificationDateKey,
-            .totalFileAllocatedSizeKey
-        ]
-        var resourceObjects = [ResourceObject]()
-        var filesToDelete = [URL]()
-        var totalSize: UInt = 0
-        let fileEnumerator = fileManager.enumerator(
-            at: storageURL,
-            includingPropertiesForKeys: resourceKeys,
-            options: .skipsHiddenFiles,
-            errorHandler: nil
-        )
-        
-        guard let urlArray = fileEnumerator?.allObjects as? [URL] else {
-            throw Error.fileEnumeratorFailed
-        }
-        
-        for url in urlArray {
-            let resourceValues = try url.resourceValues(forKeys: Set(resourceKeys))
-            guard resourceValues.isDirectory != true else {
-                continue
+        return try withExecutionProtection { checkpoint in
+            let storageURL = URL(fileURLWithPath: path, isDirectory: true)
+            let resourceKeys: [URLResourceKey] = [
+                .isDirectoryKey,
+                .contentModificationDateKey,
+                .totalFileAllocatedSizeKey
+            ]
+            var resourceObjects = [ResourceObject]()
+            var filesToDelete = [URL]()
+            var totalSize: UInt = 0
+            try checkpoint()
+            let fileEnumerator = fileManager.enumerator(
+                at: storageURL,
+                includingPropertiesForKeys: resourceKeys,
+                options: .skipsHiddenFiles,
+                errorHandler: nil
+            )
+            
+            guard let fileEnumerator else {
+                throw Error.fileEnumeratorFailed
             }
             
-            if let expiryDate = resourceValues.contentModificationDate, expiryDate.inThePast {
-                filesToDelete.append(url)
-                continue
+            while true {
+                try checkpoint()
+                guard let object = fileEnumerator.nextObject() else { break }
+                guard let url = object as? URL else { continue }
+                try checkpoint()
+                let resourceValues = try url.resourceValues(forKeys: Set(resourceKeys))
+                guard resourceValues.isDirectory != true else {
+                    continue
+                }
+                
+                if let expiryDate = resourceValues.contentModificationDate, expiryDate.inThePast {
+                    filesToDelete.append(url)
+                    continue
+                }
+                
+                if let fileSize = resourceValues.totalFileAllocatedSize {
+                    totalSize += UInt(fileSize)
+                    resourceObjects.append((url: url, resourceValues: resourceValues))
+                }
             }
             
-            if let fileSize = resourceValues.totalFileAllocatedSize {
-                totalSize += UInt(fileSize)
-                resourceObjects.append((url: url, resourceValues: resourceValues))
+            // Remove expired objects
+            for url in filesToDelete {
+                try checkpoint()
+                try fileManager.removeItem(at: url)
+                onRemove?(url.path)
             }
+            
+            // Remove objects if storage size exceeds max size
+            try removeResourceObjects(resourceObjects, totalSize: totalSize, checkpoint: checkpoint)
         }
-        
-        // Remove expired objects
-        for url in filesToDelete {
-            try fileManager.removeItem(at: url)
-            onRemove?(url.path)
-        }
-        
-        // Remove objects if storage size exceeds max size
-        try removeResourceObjects(resourceObjects, totalSize: totalSize)
     }
     
     public func removeInMemoryObject(forKey key: Key) throws { }
@@ -158,7 +191,10 @@ extension DiskStorage {
      - Parameter attributes: Directory attributes
      */
     func setDirectoryAttributes(_ attributes: [FileAttributeKey: Any]) throws {
-        try fileManager.setAttributes(attributes, ofItemAtPath: path)
+        return try withExecutionProtection { checkpoint in
+            try checkpoint()
+            try fileManager.setAttributes(attributes, ofItemAtPath: path)
+        }
     }
 }
 
@@ -201,10 +237,16 @@ extension DiskStorage {
     }
     
     func createDirectory() throws {
+        try withExecutionProtection { try createDirectory(checkpoint: $0) }
+    }
+
+    private func createDirectory(checkpoint: () throws -> Void) throws {
+        try checkpoint()
         guard !fileManager.fileExists(atPath: path) else {
             return
         }
         
+        try checkpoint()
         try fileManager.createDirectory(atPath: path, withIntermediateDirectories: true,
                                         attributes: nil)
     }
@@ -215,6 +257,10 @@ extension DiskStorage {
      - Parameter totalSize: Total size
      */
     func removeResourceObjects(_ objects: [ResourceObject], totalSize: UInt) throws {
+        try withExecutionProtection { try removeResourceObjects(objects, totalSize: totalSize, checkpoint: $0) }
+    }
+
+    private func removeResourceObjects(_ objects: [ResourceObject], totalSize: UInt, checkpoint: () throws -> Void) throws {
         guard config.maxSize > 0 && totalSize > config.maxSize else {
             return
         }
@@ -232,6 +278,7 @@ extension DiskStorage {
         }
         
         for file in sortedFiles {
+            try checkpoint()
             try fileManager.removeItem(at: file.url)
             onRemove?(file.url.path)
             
@@ -250,11 +297,15 @@ extension DiskStorage {
      - Parameter key: Unique key to identify the object in the cache
      */
     func removeObjectIfExpired(forKey key: Key) throws {
-        let filePath = makeFilePath(for: key)
-        let attributes = try fileManager.attributesOfItem(atPath: filePath)
-        if let expiryDate = attributes[.modificationDate] as? Date, expiryDate.inThePast {
-            try fileManager.removeItem(atPath: filePath)
-            onRemove?(filePath)
+        return try withExecutionProtection { checkpoint in
+            let filePath = makeFilePath(for: key)
+            try checkpoint()
+            let attributes = try fileManager.attributesOfItem(atPath: filePath)
+            if let expiryDate = attributes[.modificationDate] as? Date, expiryDate.inThePast {
+                try checkpoint()
+                try fileManager.removeItem(atPath: filePath)
+                onRemove?(filePath)
+            }
         }
     }
 }
@@ -265,7 +316,8 @@ public extension DiskStorage {
             config: config,
             fileManager: fileManager,
             path: path,
-            transformer: transformer
+            transformer: transformer,
+            acquireExecutionLease: acquireExecutionLease
         )
         
         return storage
@@ -275,9 +327,24 @@ public extension DiskStorage {
 public extension DiskStorage {
     /// Calculates the total size of the cache directory in bytes.
     var totalSize: Int? {
-        if let directory = URL(string: self.path), let size = self.fileManager.sizeOfDirectory(at: directory) {
+        try? withExecutionProtection { checkpoint -> Int? in
+            guard let directory = URL(string: self.path),
+                  let enumerator = fileManager.enumerator(at: directory, includingPropertiesForKeys: [], options: [], errorHandler: { _, _ in false }) else { return nil }
+            var size = 0
+            while true {
+                try checkpoint()
+                guard let object = enumerator.nextObject() else { break }
+                guard let url = object as? URL else { continue }
+                try checkpoint()
+                size += url.fileSize ?? 0
+            }
             return size
         }
-        return nil
+    }
+}
+
+private extension DiskStorage {
+    func withExecutionProtection<Result>(_ operation: (() throws -> Void) throws -> Result) throws -> Result {
+        try CacheStorageExecutionProtection.withLease(acquisition: acquireExecutionLease, operation: operation)
     }
 }
